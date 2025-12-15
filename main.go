@@ -69,7 +69,7 @@ type throttle struct {
 
 func newThrottle(kbps int) *throttle {
   if kbps <= 0 {
-    return &throttle{targetBps: 0, start: time.Now()}
+    kbps = 128
   }
   return &throttle{
     targetBps: int64(kbps) * 1000 / 8,
@@ -78,9 +78,6 @@ func newThrottle(kbps int) *throttle {
 }
 
 func (t *throttle) Pace(n int) {
-  if t.targetBps <= 0 {
-    return // no throttling
-  }
   t.written += int64(n)
   elapsed := time.Since(t.start)
   if elapsed <= 0 {
@@ -310,6 +307,9 @@ func main() {
   rescan := flag.Duration("rescan", 10*time.Second, "delay when playlist is empty or rebuild fails")
   mimeOverride := flag.String("mime", "", "override MIME for /radio (advanced)")
   flag.Parse()
+  if *bitrateKbps <= 0 {
+    log.Fatalf("-bitrate-kbps must be > 0")
+  }
 
   root, err := resolveRoot(*musicDirFlag)
   if err != nil {

@@ -1,1 +1,1 @@
-./sprout-waves -format ogg -host radio.norayr.am -bitrate-kbps 0
+./sprout-waves -format mp3 -host radio.norayr.am -bitrate-kbps 320
