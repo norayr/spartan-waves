@@ -66,7 +66,7 @@ type throttle struct {
 
 func newThrottle(kbps int) *throttle {
   if kbps <= 0 {
-    kbps = 128
+    return &throttle{targetBps: 0, start: time.Now()}
   }
   return &throttle{
     targetBps: int64(kbps) * 1000 / 8,
@@ -75,6 +75,9 @@ func newThrottle(kbps int) *throttle {
 }
 
 func (t *throttle) Pace(n int) {
+  if t.targetBps <= 0 {
+    return // no throttling
+  }
   t.written += int64(n)
   elapsed := time.Since(t.start)
   if elapsed <= 0 {
