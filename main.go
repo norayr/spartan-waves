@@ -22,6 +22,7 @@ type Broadcaster struct {
   addSub    chan Subscriber
   removeSub chan Subscriber
   broadcast chan []byte
+  subCount  int
 }
 
 func NewBroadcaster() *Broadcaster {
@@ -38,11 +39,13 @@ func (b *Broadcaster) Run() {
     select {
     case sub := <-b.addSub:
       b.subs[sub] = true
+      b.subCount++
 
     case sub := <-b.removeSub:
       if _, ok := b.subs[sub]; ok {
         delete(b.subs, sub)
         close(sub)
+        b.subCount--
       }
 
     case frame := <-b.broadcast:
