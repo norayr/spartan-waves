@@ -57,6 +57,8 @@ func main() {
     cmd = exec.Command("ffplay", "-nodisp", "-autoexit", "-i", "-")
   case "mpv":
     cmd = exec.Command("mpv", "--no-video", "-")
+  case "mplayer":
+    cmd = exec.Command("mplayer", "-really-quiet", "-")
   case "vlc":
     // VLC reads stdin via "-" on some platforms; on others you may need "fd://0"
     cmd = exec.Command("vlc", "-")
