@@ -1,1 +1,1 @@
-./sprout-waves -format mp3 -host radio.norayr.am -bitrate-kbps 320
+./spartan-waves -format mp3 -host radio.norayr.am -bitrate-kbps 320
