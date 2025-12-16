@@ -1,1 +1,1 @@
-./swp -host radio.norayr.am -path /radio -player mpv
+./swp -host radio.norayr.am -path /radio -player mplayer
