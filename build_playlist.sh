@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# use like
+# ./build_playlist.sh ./music mp3 > playlist.txt
+
+
 MUSIC_DIR="${1:-./music}"
 FORMAT="${2:-mp3}" # mp3|ogg|both
 
