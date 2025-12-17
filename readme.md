@@ -8,6 +8,7 @@ It can play from a directory, or by using a playlist. It can also shuffle the pl
 
 At first we were supporting MP3's because MP3's can be played from the middle of the byte stream. However, since Lagrange Gemini browser doesn't support MP3 streaming on IOS and Android (it works perfectly fine on Maemo-Leste with mobile UI), we deprecated MP3 streams and added more complex code to stream Ogg files.
 
+Now we run ffmpeg with `-source wav` or `-source ogg`, ffmpeg encodes one ogg stream out of number of files, and our radio server broadcasts it.
 ---
 
 ## Features
@@ -20,13 +21,6 @@ At first we were supporting MP3's because MP3's can be played from the middle of
 
   * Ogg/Vorbis only
 * ⏱ Simple bitrate throttling (approximate, configurable)
-
----
-
-## Limitations (by design)
-
-* No transcoding (files are streamed as-is)
-* No ICY / metadata / track titles
 
 ---
 
@@ -55,18 +49,25 @@ go build -o spartan-radio
 
 ---
 
-## Format modes
+## Build playlist
 
-### Now Ogg only
-
-```sh
-./spartan-radio -format ogg
+```
+./build_playlist.sh` ./music wav > playlist.txt
 ```
 
-`-format` preserved for compatibility. Maybe removed later.
+## Format modes
 
-* MIME: `audio/ogg`
+### For .wav sources
 
+```sh
+./spartan-waves -source wav -playlist playlist_wav.txt -shuffle -host radio.norayr.am
+
+```
+### For .ogg sources
+
+```
+./spartan-waves -source wav -music-dir ./music -shuffle -host radio.norayr.am
+```
 ---
 
 ## Directory scanning behavior
@@ -109,67 +110,6 @@ Live audio stream.
 
 ---
 
-## Example
-First find out the bitrate of your mp3s:
-
-```
-ffprobe music/radio.ogg 2>&1"
-```
-
-It'll give us something like:
-
-```
-Input #0, ogg, from '/amp/sounds/recordings/performances/2025-12-13-anonradio/REC002.ogg':
-  Duration: 01:04:57.24, start: 0.000000, bitrate: 444 kb/s
-  Stream #0:0: Audio: vorbis, 44100 Hz, stereo, fltp, 499 kb/s
-      Metadata:
-        encoder         : Lavc61.19.101 libvorbis
-        artist          : inky from the tape
-        title           : 2025-12-13-anonradio
-        genre           : Electronic
-
-```
-
-
-```sh
-./spartan-waves -format ogg -playlist playlist_ogg.txt -bitrate-kbps 499 -host radio.norayr.am -shuffle
-```
-
-Then open in a Spartan-capable client:
-
-```text
-spartan://radio.norayr.am/radio
-```
-
-With the player, do:
-
-```
-./swp -host radio.norayr.am -path /radio -player mpv
-```
-
-However, instead of player you can just do:
-
-for mp3 stream
-
-```
-echo 'radio.norayr.am /radio 0' |nc norayr.am 300 |sox -tmp3 - -d
-```
-
-for ogg stream:
-```
-echo 'radio.norayr.am /radio 0' | nc norayr.am 300 | sox -V0 -togg  -  -d
-```
-
----
-
-## Why Spartan?
-
-* Simple text-based protocol
-* No TLS or PKI
-* Suitable for experimental networks (Yggdrasil, mesh, local-only)
-* Fits well with Gemini-adjacent tooling
-
----
 
 ## License
 
