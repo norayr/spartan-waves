@@ -3,9 +3,10 @@
 A minimal **Spartan protocol** audio streamer written in Go.
 
 It serves a **single live radio stream** at `/radio`, streaming audio files from a directory in real time.
-The music directory is scanned **recursively**, may be a **symlink**, and can contain MP3, Ogg, or both.
 
-This is intentionally simple: no HTTP, no TLS, no transcoding, no metadata — just bytes over Spartan.
+It can play from a directory, or by using a playlist. It can also shuffle the playlist.
+
+At first we were supporting MP3's because MP3's can be played from the middle of the byte stream. However, since Lagrange Gemini browser doesn't support MP3 streaming on IOS and Android (it works perfectly fine on Maemo-Leste with mobile UI), we deprecated MP3 streams and added more complex code to stream Ogg files.
 
 ---
 
@@ -17,18 +18,13 @@ This is intentionally simple: no HTTP, no TLS, no transcoding, no metadata — j
 * 🔗 Music directory can be a **symlink**
 * 🎧 Supports:
 
-  * MP3 only
   * Ogg/Vorbis only
-  * MP3 + Ogg mixed (optional, with caveat)
 * ⏱ Simple bitrate throttling (approximate, configurable)
-* 🔄 Playlist rebuilt automatically between cycles
 
 ---
 
 ## Limitations (by design)
 
-* One fixed MIME type per connection (Spartan requirement)
-* When using mixed formats (`-format=both`), MIME must be generic
 * No transcoding (files are streamed as-is)
 * No ICY / metadata / track titles
 
@@ -39,14 +35,6 @@ This is intentionally simple: no HTTP, no TLS, no transcoding, no metadata — j
 ```sh
 go build -o spartan-radio
 ```
-
-Or run directly:
-
-```sh
-go run .
-```
-
----
 
 ## Usage
 
@@ -61,52 +49,23 @@ go run .
 | `-music-dir`    | `./music`   | Directory containing audio files (can be a symlink) |
 | `-port`         | `300`       | TCP port to listen on (Spartan default)             |
 | `-host`         | `localhost` | Hostname used in the index page links               |
-| `-format`       | `mp3`       | `mp3`, `ogg`, or `both`                             |
 | `-bitrate-kbps` | `128`       | Approximate stream bitrate (throttling only)        |
-| `-rescan`       | `10s`       | Delay when playlist is empty or rebuild fails       |
-| `-mime`         | *(auto)*    | Override MIME type manually (advanced)              |
+| `-playlist`     | `somefile.txt` | Playlist       |
+| `-shuffle`      |  | Shuffle the playlist       |
 
 ---
 
 ## Format modes
 
-### MP3 only
-
-```sh
-./spartan-radio -format mp3
-```
-
-* Playlist includes only `.mp3`
-* MIME: `audio/mpeg`
-* Safest option for most players
-
----
-
-### Ogg only
+### Now Ogg only
 
 ```sh
 ./spartan-radio -format ogg
 ```
 
-* Playlist includes `.ogg` and `.oga`
+`-format` preserved for compatibility. Maybe removed later.
+
 * MIME: `audio/ogg`
-
----
-
-### Mixed MP3 + Ogg
-
-```sh
-./spartan-radio -format both
-```
-
-* Playlist includes `.mp3`, `.ogg`, `.oga`
-* MIME: `application/octet-stream`
-
-⚠ **Important**
-This works only if the client/player can **sniff the audio format from the byte stream**.
-Many players cannot seamlessly switch formats mid-stream.
-
-If you want full compatibility, use **one format only** or add transcoding.
 
 ---
 
@@ -126,7 +85,7 @@ music/
 │   ├── a.ogg
 │   └── b.ogg
 ├── rock/
-│   └── song.mp3
+│   └── song.ogg
 └── live -> /mnt/music/live-recordings
 ```
 
@@ -154,18 +113,26 @@ Live audio stream.
 First find out the bitrate of your mp3s:
 
 ```
-ffprobe music/21_car_radio.mp3 2>&1 | grep -E "Audio: mp3"
+ffprobe music/radio.ogg 2>&1"
 ```
 
 It'll give us something like:
 
 ```
-./sprout-waves -format mp3 -bitrate-kbps 256
+Input #0, ogg, from '/amp/sounds/recordings/performances/2025-12-13-anonradio/REC002.ogg':
+  Duration: 01:04:57.24, start: 0.000000, bitrate: 444 kb/s
+  Stream #0:0: Audio: vorbis, 44100 Hz, stereo, fltp, 499 kb/s
+      Metadata:
+        encoder         : Lavc61.19.101 libvorbis
+        artist          : inky from the tape
+        title           : 2025-12-13-anonradio
+        genre           : Electronic
+
 ```
 
 
 ```sh
-./sprout-waves -format mp3 -host radio.norayr.am -bitrate-kbps 320
+./spartan-waves -format ogg -playlist playlist_ogg.txt -bitrate-kbps 499 -host radio.norayr.am -shuffle
 ```
 
 Then open in a Spartan-capable client:
@@ -182,8 +149,15 @@ With the player, do:
 
 However, instead of player you can just do:
 
+for mp3 stream
+
 ```
 echo 'radio.norayr.am /radio 0' |nc norayr.am 300 |sox -tmp3 - -d
+```
+
+for ogg stream:
+```
+echo 'radio.norayr.am /radio 0' | nc norayr.am 300 | sox -V0 -togg  -  -d
 ```
 
 ---
