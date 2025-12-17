@@ -7,6 +7,7 @@ import (
   "fmt"
   "io"
   "log"
+  "math/rand"
   "net"
   "os"
   "path/filepath"
@@ -25,8 +26,7 @@ type Broadcaster struct {
   removeSub chan Subscriber
   broadcast chan []byte
 
-  // Cached Ogg/Vorbis headers (as raw Ogg pages bytes). Sent to new subscribers
-  // so they can decode even if they join mid-stream.
+  // Cached Ogg/Vorbis headers as raw Ogg pages bytes.
   hmu    sync.RWMutex
   header []byte
   subCount int
@@ -53,8 +53,8 @@ func (b *Broadcaster) Run() {
       if _, ok := b.subs[sub]; ok {
         delete(b.subs, sub)
         close(sub)
-        b.subCount--
-        log.Printf("Listeners: %d", b.subCount)
+         b.subCount--
+         log.Printf("Listeners: %d", b.subCount)
       }
 
     case frame := <-b.broadcast:
@@ -94,8 +94,8 @@ type throttle struct {
 }
 
 func newThrottle(kbps int) *throttle {
-  // We want "natural playback speed", so require a positive bitrate.
-  // Use the audio bitrate from ffprobe output (e.g., ~499 for your Vorbis file).
+  // For “natural speed”, you must pace output.
+  // Use ffprobe's audio bitrate (~499 for your Vorbis file).
   if kbps <= 0 {
     kbps = 192
   }
@@ -125,7 +125,69 @@ func resolveRoot(path string) (string, error) {
   return filepath.Abs(real)
 }
 
-func buildPlaylistRecursive(root string) ([]string, error) {
+func resolveExistingFile(p string, baseDir string) (string, bool) {
+  // Expand relative paths relative to playlist file directory, if provided.
+  if !filepath.IsAbs(p) && baseDir != "" {
+    p = filepath.Join(baseDir, p)
+  }
+  // Clean + try eval symlinks to reduce duplicates
+  p = filepath.Clean(p)
+
+  // Stat (following symlink)
+  if st, err := os.Stat(p); err == nil && !st.IsDir() {
+    if abs, err := filepath.Abs(p); err == nil {
+      p = abs
+    }
+    return p, true
+  }
+  return "", false
+}
+
+func readPlaylistFile(listPath string) ([]string, error) {
+  f, err := os.Open(listPath)
+  if err != nil {
+    return nil, err
+  }
+  defer f.Close()
+
+  baseDir := filepath.Dir(listPath)
+
+  var out []string
+  sc := bufio.NewScanner(f)
+  for sc.Scan() {
+    line := strings.TrimSpace(sc.Text())
+    if line == "" {
+      continue
+    }
+    // allow comments
+    if strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+      continue
+    }
+    // accept leading "./"
+    line = strings.TrimPrefix(line, "\uFEFF") // strip BOM if any
+
+    p, ok := resolveExistingFile(line, baseDir)
+    if !ok {
+      log.Printf("playlist: skipping missing file: %s", line)
+      continue
+    }
+    ext := strings.ToLower(filepath.Ext(p))
+    if ext != ".ogg" && ext != ".oga" {
+      log.Printf("playlist: skipping non-ogg file: %s", p)
+      continue
+    }
+    out = append(out, p)
+  }
+  if err := sc.Err(); err != nil {
+    return nil, err
+  }
+
+  return out, nil
+}
+
+// Recursively walks root. Follows symlinked dirs too, but avoids cycles by tracking
+// resolved real paths of visited directories.
+func buildOggListFromDir(root string) ([]string, error) {
   root = filepath.Clean(root)
 
   seenDirs := map[string]bool{}
@@ -203,11 +265,10 @@ func readNextOggPage(r *bufio.Reader) ([]byte, error) {
     if bytes.Equal(b, []byte("OggS")) {
       break
     }
-    // Discard one byte and keep scanning
     _, _ = r.ReadByte()
   }
 
-  // Now read fixed header (27 bytes)
+  // Fixed header is 27 bytes
   hdr := make([]byte, 27)
   if _, err := io.ReadFull(r, hdr); err != nil {
     return nil, err
@@ -238,14 +299,13 @@ func readNextOggPage(r *bufio.Reader) ([]byte, error) {
   return page, nil
 }
 
+// Collects enough Ogg pages to include the 3 Vorbis header packets.
 type vorbisHeaderFinder struct {
   gotPackets int
   packetBuf  []byte
 }
 
 func (vh *vorbisHeaderFinder) feedPage(page []byte) {
-  // Ogg page layout:
-  // 0..26 header (27 bytes), [26]=page_segments, then segment table, then body.
   if len(page) < 27 {
     return
   }
@@ -257,11 +317,8 @@ func (vh *vorbisHeaderFinder) feedPage(page []byte) {
   segTable := page[27 : 27+segCount]
   body := page[27+segCount:]
 
-  // If continuation flag set, first packet continues from previous page.
-  // If not set, we start fresh for packet boundaries at page start.
+  // If not a continuation at page start, reset packet buffer.
   if (hdrType & 0x01) == 0 {
-    // Not a continuation at page start: packetBuf should be empty for new packets.
-    // But if it isn't, drop it (corruption/edge case).
     vh.packetBuf = nil
   }
 
@@ -288,28 +345,41 @@ func (vh *vorbisHeaderFinder) checkPacket(pkt []byte) {
   }
   // Vorbis header packet: [type][ "vorbis" ...]
   // type is 0x01, 0x03, 0x05 for the three header packets.
-  if len(pkt) >= 7 && (pkt[0] == 0x01 || pkt[0] == 0x03 || pkt[0] == 0x05) && bytes.Equal(pkt[1:7], []byte("vorbis")) {
+  if len(pkt) >= 7 &&
+    (pkt[0] == 0x01 || pkt[0] == 0x03 || pkt[0] == 0x05) &&
+    bytes.Equal(pkt[1:7], []byte("vorbis")) {
     vh.gotPackets++
   }
 }
 
-func (vh *vorbisHeaderFinder) done() bool {
-  return vh.gotPackets >= 3
-}
+func (vh *vorbisHeaderFinder) done() bool { return vh.gotPackets >= 3 }
 
 // --- Streaming ---------------------------------------------------------------
 
-func streamOggFolder(root string, b *Broadcaster, bitrateKbps int, rescanDelay time.Duration) {
+func streamOgg(root string, playlistPath string, shuffle bool, b *Broadcaster, bitrateKbps int, rescanDelay time.Duration) {
+  rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+  loadList := func() ([]string, error) {
+    if playlistPath != "" {
+      return readPlaylistFile(playlistPath)
+    }
+    return buildOggListFromDir(root)
+  }
+
   for {
-    files, err := buildPlaylistRecursive(root)
+    files, err := loadList()
     if err != nil {
-      log.Printf("playlist error: %v", err)
+      log.Printf("playlist load error: %v", err)
       time.Sleep(rescanDelay)
       continue
     }
     if len(files) == 0 {
       time.Sleep(rescanDelay)
       continue
+    }
+
+    if shuffle {
+      rng.Shuffle(len(files), func(i, j int) { files[i], files[j] = files[j], files[i] })
     }
 
     for _, fpath := range files {
@@ -324,8 +394,7 @@ func streamOggFolder(root string, b *Broadcaster, bitrateKbps int, rescanDelay t
       r := bufio.NewReaderSize(f, 256*1024)
       th := newThrottle(bitrateKbps)
 
-      // Build and cache Vorbis headers as Ogg pages, Icecast-style.
-      // We also broadcast these pages to current listeners.
+      // Pattern A: cache Vorbis headers as Ogg pages, and broadcast them too.
       var headerBuf bytes.Buffer
       vh := &vorbisHeaderFinder{}
 
@@ -340,20 +409,16 @@ func streamOggFolder(root string, b *Broadcaster, bitrateKbps int, rescanDelay t
         vh.feedPage(page)
         headerBuf.Write(page)
 
-        // Broadcast header pages too (listeners already connected should hear from start).
         b.broadcast <- page
         th.Pace(len(page))
       }
 
-      // Publish header cache for late joiners.
       if headerBuf.Len() > 0 && vh.done() {
         b.SetHeader(headerBuf.Bytes())
       } else {
-        // If we couldn't extract headers, keep whatever header was previously set.
         log.Printf("WARNING: could not confirm Vorbis headers for %s (late join may fail)", fpath)
       }
 
-      // Stream remaining pages
       for {
         page, err := readNextOggPage(r)
         if err != nil {
@@ -368,18 +433,18 @@ func streamOggFolder(root string, b *Broadcaster, bitrateKbps int, rescanDelay t
 
       _ = f.Close()
     }
+    // loop forever; reload list each cycle (so your playlist edits take effect)
   }
 }
 
 func handleRadio(conn net.Conn, b *Broadcaster) {
   defer conn.Close()
 
-  // Spartan success + MIME
   if _, err := fmt.Fprintf(conn, "2 audio/ogg\r\n"); err != nil {
     return
   }
 
-  // Icecast-like: send cached headers first, so client can decode even mid-stream.
+  // Pattern A: send cached Vorbis headers first for late joiners.
   if hdr := b.GetHeaderCopy(); len(hdr) > 0 {
     if _, err := conn.Write(hdr); err != nil {
       return
@@ -435,7 +500,7 @@ func handleRequest(conn net.Conn, b *Broadcaster, host string, port int) {
   case "/", "/index.gmi", "/index.txt":
     base := fmt.Sprintf("spartan://%s:%d", host, port)
     body := "Spartan Radio (Ogg Vorbis)\n\n" +
-      "=> " + base + "/radio Tune in (audio/ogg)\n"
+      "=> " + base + "/radio Tune in\n"
     fmt.Fprintf(conn, "2 text/gemini; charset=utf-8\r\n%s", body)
 
   case "/radio":
@@ -448,20 +513,42 @@ func handleRequest(conn net.Conn, b *Broadcaster, host string, port int) {
 
 func main() {
   musicDirFlag := flag.String("music-dir", "./music", "directory with .ogg/.oga files (can be a symlink)")
+  playlistFlag := flag.String("playlist", "", "path to playlist text file (one path per line). If set, music-dir scanning is not used.")
+  shuffleFlag := flag.Bool("shuffle", false, "shuffle playlist each cycle")
   port := flag.Int("port", 300, "TCP port to listen on (Spartan default is 300)")
   host := flag.String("host", "localhost", "host name to advertise in index (spartan://HOST:PORT/...)")
-  bitrateKbps := flag.Int("bitrate-kbps", 192, "target stream bitrate (kbps). Use ffprobe's audio bitrate (e.g. ~499 for your REC002.ogg)")
+
+  // Kept for compatibility with your earlier CLI, but this build is ogg/vorbis only.
+  format := flag.String("format", "ogg", "format to stream (only 'ogg' supported in this build)")
+  bitrateKbps := flag.Int("bitrate-kbps", 192, "target stream bitrate (kbps). Use ffprobe audio bitrate (e.g. ~499)")
   rescan := flag.Duration("rescan", 10*time.Second, "delay when playlist is empty or rebuild fails")
+
   flag.Parse()
 
-  root, err := resolveRoot(*musicDirFlag)
-  if err != nil {
-    log.Fatalf("failed to resolve music-dir %q: %v", *musicDirFlag, err)
+  if strings.ToLower(*format) != "ogg" {
+    log.Fatalf("this build supports only -format ogg (Pattern A Vorbis headers). got: %q", *format)
+  }
+  if *bitrateKbps <= 0 {
+    log.Fatalf("-bitrate-kbps must be > 0 (use ffprobe audio bitrate, e.g. ~499)")
+  }
+
+  root := ""
+  var err error
+  if *playlistFlag == "" {
+    root, err = resolveRoot(*musicDirFlag)
+    if err != nil {
+      log.Fatalf("failed to resolve music-dir %q: %v", *musicDirFlag, err)
+    }
+  } else {
+    // Resolve playlist path to absolute for stable base dir resolution.
+    if abs, e := filepath.Abs(*playlistFlag); e == nil {
+      *playlistFlag = abs
+    }
   }
 
   b := NewBroadcaster()
   go b.Run()
-  go streamOggFolder(root, b, *bitrateKbps, *rescan)
+  go streamOgg(root, *playlistFlag, *shuffleFlag, b, *bitrateKbps, *rescan)
 
   addr := fmt.Sprintf(":%d", *port)
   ln, err := net.Listen("tcp", addr)
@@ -470,8 +557,12 @@ func main() {
   }
 
   log.Printf("Spartan Radio listening on spartan://%s:%d/", *host, *port)
-  log.Printf("Serving from (resolved): %s", root)
-  log.Printf("Ogg/Vorbis mode. bitrate-kbps=%d", *bitrateKbps)
+  if *playlistFlag != "" {
+    log.Printf("Playlist file: %s", *playlistFlag)
+  } else {
+    log.Printf("Serving from (resolved): %s", root)
+  }
+  log.Printf("Mode: ogg/vorbis (Pattern A headers). shuffle=%v bitrate-kbps=%d", *shuffleFlag, *bitrateKbps)
 
   for {
     conn, err := ln.Accept()
@@ -482,3 +573,4 @@ func main() {
     go handleRequest(conn, b, *host, *port)
   }
 }
+
