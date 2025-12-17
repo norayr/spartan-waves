@@ -52,21 +52,21 @@ go build -o spartan-radio
 ## Build playlist
 
 ```
-./build_playlist.sh` ./music wav > playlist.txt
+./build_playlist.sh ./music wav > playlist.txt
 ```
 
 ## Format modes
 
 ### For .wav sources
 
-```sh
-./spartan-waves -source wav -playlist playlist_wav.txt -shuffle -host radio.norayr.am
-
 ```
+./spartan-waves -source wav -music-dir ./music -shuffle -playlist playlist.txt -host radio.norayr.am
+```
+
 ### For .ogg sources
 
 ```
-./spartan-waves -source wav -music-dir ./music -shuffle -host radio.norayr.am
+./spartan-waves -source ogg -music-dir ./music -shuffle -playlist playlist.txt -host radio.norayr.am
 ```
 ---
 

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# Usage:
+# ./build_playlist.sh ./music wav > playlist.txt
+
 set -euo pipefail
 
 MUSIC_DIR="${1:-./music}"
