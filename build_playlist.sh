@@ -15,6 +15,6 @@ case "$FORMAT" in
   *) echo "bad format"; exit 2 ;;
 esac
 
-find -L ${MUSIC_DIR} -type f -iname '*.mp3' | sort
+find -L ${MUSIC_DIR} -type f -iname '*.ogg' | sort
 
 
