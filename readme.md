@@ -180,6 +180,12 @@ With the player, do:
 ./swp -host radio.norayr.am -path /radio -player mpv
 ```
 
+However, instead of player you can just do:
+
+```
+echo 'radio.norayr.am /radio 0' |nc norayr.am 300 |sox -tmp3 - -d
+```
+
 ---
 
 ## Why Spartan?
