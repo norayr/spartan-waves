@@ -2,18 +2,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 )
 
@@ -24,7 +24,11 @@ type Broadcaster struct {
 	addSub    chan Subscriber
 	removeSub chan Subscriber
 	broadcast chan []byte
-	subCount  int64 // atomic
+
+	// Cached Ogg/Vorbis headers (as raw Ogg pages bytes). Sent to new subscribers
+	// so they can decode even if they join mid-stream.
+	hmu    sync.RWMutex
+	header []byte
 }
 
 func NewBroadcaster() *Broadcaster {
@@ -36,22 +40,16 @@ func NewBroadcaster() *Broadcaster {
 	}
 }
 
-func (b *Broadcaster) Count() int64 {
-	return atomic.LoadInt64(&b.subCount)
-}
-
 func (b *Broadcaster) Run() {
 	for {
 		select {
 		case sub := <-b.addSub:
 			b.subs[sub] = true
-			atomic.AddInt64(&b.subCount, 1)
 
 		case sub := <-b.removeSub:
 			if _, ok := b.subs[sub]; ok {
 				delete(b.subs, sub)
 				close(sub)
-				atomic.AddInt64(&b.subCount, -1)
 			}
 
 		case frame := <-b.broadcast:
@@ -59,14 +57,29 @@ func (b *Broadcaster) Run() {
 				select {
 				case sub <- frame:
 				default:
-					// Slow / stuck client: drop it
 					delete(b.subs, sub)
 					close(sub)
-					atomic.AddInt64(&b.subCount, -1)
 				}
 			}
 		}
 	}
+}
+
+func (b *Broadcaster) SetHeader(h []byte) {
+	b.hmu.Lock()
+	b.header = h
+	b.hmu.Unlock()
+}
+
+func (b *Broadcaster) GetHeaderCopy() []byte {
+	b.hmu.RLock()
+	defer b.hmu.RUnlock()
+	if len(b.header) == 0 {
+		return nil
+	}
+	out := make([]byte, len(b.header))
+	copy(out, b.header)
+	return out
 }
 
 type throttle struct {
@@ -76,8 +89,10 @@ type throttle struct {
 }
 
 func newThrottle(kbps int) *throttle {
+	// We want "natural playback speed", so require a positive bitrate.
+	// Use the audio bitrate from ffprobe output (e.g., ~499 for your Vorbis file).
 	if kbps <= 0 {
-		kbps = 128
+		kbps = 192
 	}
 	return &throttle{
 		targetBps: int64(kbps) * 1000 / 8,
@@ -105,22 +120,7 @@ func resolveRoot(path string) (string, error) {
 	return filepath.Abs(real)
 }
 
-func allowedExts(format string) map[string]bool {
-	switch strings.ToLower(format) {
-	case "mp3":
-		return map[string]bool{".mp3": true}
-	case "ogg":
-		return map[string]bool{".ogg": true, ".oga": true}
-	case "both":
-		return map[string]bool{".mp3": true, ".ogg": true, ".oga": true}
-	default:
-		return map[string]bool{".mp3": true}
-	}
-}
-
-// Recursively walks root. Follows symlinked dirs too, but avoids cycles by tracking
-// resolved real paths of visited directories.
-func buildPlaylistRecursive(root string, exts map[string]bool) ([]string, error) {
+func buildPlaylistRecursive(root string) ([]string, error) {
 	root = filepath.Clean(root)
 
 	seenDirs := map[string]bool{}
@@ -146,13 +146,11 @@ func buildPlaylistRecursive(root string, exts map[string]bool) ([]string, error)
 
 		for _, e := range entries {
 			full := filepath.Join(dir, e.Name())
-
 			info, err := e.Info()
 			if err != nil {
 				continue
 			}
 
-			// Handle symlink entries by stat()'ing the target
 			if info.Mode()&os.ModeSymlink != 0 {
 				tinfo, err := os.Stat(full)
 				if err != nil {
@@ -163,7 +161,7 @@ func buildPlaylistRecursive(root string, exts map[string]bool) ([]string, error)
 					continue
 				}
 				ext := strings.ToLower(filepath.Ext(e.Name()))
-				if exts[ext] {
+				if ext == ".ogg" || ext == ".oga" {
 					out = append(out, full)
 				}
 				continue
@@ -175,69 +173,130 @@ func buildPlaylistRecursive(root string, exts map[string]bool) ([]string, error)
 			}
 
 			ext := strings.ToLower(filepath.Ext(e.Name()))
-			if exts[ext] {
+			if ext == ".ogg" || ext == ".oga" {
 				out = append(out, full)
 			}
 		}
-
 		return nil
 	}
 
 	_ = walk(root)
-
 	sort.Strings(out)
 	return out, nil
 }
 
-// Playlist file: one path per line. Empty lines and lines starting with # are ignored.
-// Relative paths are resolved relative to the playlist file directory.
-func readPlaylistFile(plPath string) ([]string, error) {
-	f, err := os.Open(plPath)
-	if err != nil {
+// --- Ogg page reader ---------------------------------------------------------
+
+// Reads the next Ogg page (starts with "OggS") and returns the full page bytes.
+func readNextOggPage(r *bufio.Reader) ([]byte, error) {
+	// Find capture pattern "OggS"
+	for {
+		b, err := r.Peek(4)
+		if err != nil {
+			return nil, err
+		}
+		if bytes.Equal(b, []byte("OggS")) {
+			break
+		}
+		// Discard one byte and keep scanning
+		_, _ = r.ReadByte()
+	}
+
+	// Now read fixed header (27 bytes)
+	hdr := make([]byte, 27)
+	if _, err := io.ReadFull(r, hdr); err != nil {
 		return nil, err
 	}
-	defer f.Close()
-
-	baseDir := filepath.Dir(plPath)
-
-	var out []string
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if !filepath.IsAbs(line) {
-			line = filepath.Join(baseDir, line)
-		}
-		line = filepath.Clean(line)
-		out = append(out, line)
+	if !bytes.Equal(hdr[:4], []byte("OggS")) {
+		return nil, fmt.Errorf("ogg: lost sync (no OggS)")
 	}
-	if err := sc.Err(); err != nil {
+
+	segCount := int(hdr[26])
+	segTable := make([]byte, segCount)
+	if _, err := io.ReadFull(r, segTable); err != nil {
 		return nil, err
 	}
-	return out, nil
+
+	bodyLen := 0
+	for _, v := range segTable {
+		bodyLen += int(v)
+	}
+	body := make([]byte, bodyLen)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, err
+	}
+
+	page := make([]byte, 0, 27+segCount+bodyLen)
+	page = append(page, hdr...)
+	page = append(page, segTable...)
+	page = append(page, body...)
+	return page, nil
 }
 
-func maybeShuffle(files []string, shuffle bool) {
-	if !shuffle || len(files) <= 1 {
+type vorbisHeaderFinder struct {
+	gotPackets int
+	packetBuf  []byte
+}
+
+func (vh *vorbisHeaderFinder) feedPage(page []byte) {
+	// Ogg page layout:
+	// 0..26 header (27 bytes), [26]=page_segments, then segment table, then body.
+	if len(page) < 27 {
 		return
 	}
-	rand.Shuffle(len(files), func(i, j int) { files[i], files[j] = files[j], files[i] })
+	segCount := int(page[26])
+	if len(page) < 27+segCount {
+		return
+	}
+	hdrType := page[5]
+	segTable := page[27 : 27+segCount]
+	body := page[27+segCount:]
+
+	// If continuation flag set, first packet continues from previous page.
+	// If not set, we start fresh for packet boundaries at page start.
+	if (hdrType & 0x01) == 0 {
+		// Not a continuation at page start: packetBuf should be empty for new packets.
+		// But if it isn't, drop it (corruption/edge case).
+		vh.packetBuf = nil
+	}
+
+	offset := 0
+	for _, lace := range segTable {
+		n := int(lace)
+		if offset+n > len(body) {
+			return
+		}
+		vh.packetBuf = append(vh.packetBuf, body[offset:offset+n]...)
+		offset += n
+
+		// Packet ends when lacing value < 255
+		if lace < 255 {
+			vh.checkPacket(vh.packetBuf)
+			vh.packetBuf = nil
+		}
+	}
 }
 
-// Streams files forever. Playlist is rebuilt each cycle to pick up changes.
-func streamForever(root string, exts map[string]bool, playlistPath string, shuffle bool, b *Broadcaster, bitrateKbps int, rescanDelay time.Duration) {
+func (vh *vorbisHeaderFinder) checkPacket(pkt []byte) {
+	if vh.gotPackets >= 3 {
+		return
+	}
+	// Vorbis header packet: [type][ "vorbis" ...]
+	// type is 0x01, 0x03, 0x05 for the three header packets.
+	if len(pkt) >= 7 && (pkt[0] == 0x01 || pkt[0] == 0x03 || pkt[0] == 0x05) && bytes.Equal(pkt[1:7], []byte("vorbis")) {
+		vh.gotPackets++
+	}
+}
+
+func (vh *vorbisHeaderFinder) done() bool {
+	return vh.gotPackets >= 3
+}
+
+// --- Streaming ---------------------------------------------------------------
+
+func streamOggFolder(root string, b *Broadcaster, bitrateKbps int, rescanDelay time.Duration) {
 	for {
-		var files []string
-		var err error
-
-		if playlistPath != "" {
-			files, err = readPlaylistFile(playlistPath)
-		} else {
-			files, err = buildPlaylistRecursive(root, exts)
-		}
-
+		files, err := buildPlaylistRecursive(root)
 		if err != nil {
 			log.Printf("playlist error: %v", err)
 			time.Sleep(rescanDelay)
@@ -248,8 +307,6 @@ func streamForever(root string, exts map[string]bool, playlistPath string, shuff
 			continue
 		}
 
-		maybeShuffle(files, shuffle)
-
 		for _, fpath := range files {
 			log.Printf("Now playing: %s", fpath)
 
@@ -259,24 +316,49 @@ func streamForever(root string, exts map[string]bool, playlistPath string, shuff
 				continue
 			}
 
-			br := bufio.NewReaderSize(f, 64*1024)
+			r := bufio.NewReaderSize(f, 256*1024)
 			th := newThrottle(bitrateKbps)
-			buf := make([]byte, 16*1024)
 
-			for {
-				n, err := br.Read(buf)
-				if n > 0 {
-					chunk := make([]byte, n)
-					copy(chunk, buf[:n])
-					b.broadcast <- chunk
-					th.Pace(n)
-				}
+			// Build and cache Vorbis headers as Ogg pages, Icecast-style.
+			// We also broadcast these pages to current listeners.
+			var headerBuf bytes.Buffer
+			vh := &vorbisHeaderFinder{}
+
+			for !vh.done() {
+				page, err := readNextOggPage(r)
 				if err != nil {
 					if err != io.EOF {
-						log.Printf("read error: %v", err)
+						log.Printf("ogg read error (headers): %v", err)
 					}
 					break
 				}
+				vh.feedPage(page)
+				headerBuf.Write(page)
+
+				// Broadcast header pages too (listeners already connected should hear from start).
+				b.broadcast <- page
+				th.Pace(len(page))
+			}
+
+			// Publish header cache for late joiners.
+			if headerBuf.Len() > 0 && vh.done() {
+				b.SetHeader(headerBuf.Bytes())
+			} else {
+				// If we couldn't extract headers, keep whatever header was previously set.
+				log.Printf("WARNING: could not confirm Vorbis headers for %s (late join may fail)", fpath)
+			}
+
+			// Stream remaining pages
+			for {
+				page, err := readNextOggPage(r)
+				if err != nil {
+					if err != io.EOF {
+						log.Printf("ogg read error: %v", err)
+					}
+					break
+				}
+				b.broadcast <- page
+				th.Pace(len(page))
 			}
 
 			_ = f.Close()
@@ -284,40 +366,39 @@ func streamForever(root string, exts map[string]bool, playlistPath string, shuff
 	}
 }
 
-func handleRadio(conn net.Conn, b *Broadcaster, mime string) {
-	remote := conn.RemoteAddr().String()
-	log.Printf("RADIO CONNECT from %s (listeners=%d)", remote, b.Count()+1)
+func handleRadio(conn net.Conn, b *Broadcaster) {
+	defer conn.Close()
 
-	defer func() {
-		// Note: listener count decremented via broadcaster removeSub,
-		// so log after we request removal.
-		log.Printf("RADIO DISCONNECT from %s (listeners=%d)", remote, b.Count()-1)
-		_ = conn.Close()
-	}()
-
-	_, err := fmt.Fprintf(conn, "2 %s\r\n", mime)
-	if err != nil {
+	// Spartan success + MIME
+	if _, err := fmt.Fprintf(conn, "2 audio/ogg\r\n"); err != nil {
 		return
 	}
 
-	sub := make(Subscriber, 256)
+	// Icecast-like: send cached headers first, so client can decode even mid-stream.
+	if hdr := b.GetHeaderCopy(); len(hdr) > 0 {
+		if _, err := conn.Write(hdr); err != nil {
+			return
+		}
+	}
+
+	sub := make(Subscriber, 512)
 	b.addSub <- sub
 	defer func() { b.removeSub <- sub }()
 
-	for chunk := range sub {
-		_, err := conn.Write(chunk)
-		if err != nil {
+	for page := range sub {
+		if _, err := conn.Write(page); err != nil {
 			return
 		}
 	}
 }
 
-func handleRequest(conn net.Conn, b *Broadcaster, host string, port int, mime string) {
+func handleRequest(conn net.Conn, b *Broadcaster, host string, port int) {
+	defer conn.Close()
+
 	reader := bufio.NewReader(conn)
 
 	line, err := reader.ReadString('\n')
 	if err != nil {
-		_ = conn.Close()
 		return
 	}
 	line = strings.TrimRight(line, "\r\n")
@@ -325,7 +406,6 @@ func handleRequest(conn net.Conn, b *Broadcaster, host string, port int, mime st
 	parts := strings.Split(line, " ")
 	if len(parts) != 3 {
 		fmt.Fprintf(conn, "4 malformed request line\r\n")
-		_ = conn.Close()
 		return
 	}
 
@@ -335,7 +415,6 @@ func handleRequest(conn net.Conn, b *Broadcaster, host string, port int, mime st
 	contentLen, err := strconv.Atoi(lenStr)
 	if err != nil || contentLen < 0 {
 		fmt.Fprintf(conn, "4 invalid content-length\r\n")
-		_ = conn.Close()
 		return
 	}
 
@@ -343,7 +422,6 @@ func handleRequest(conn net.Conn, b *Broadcaster, host string, port int, mime st
 		_, err = io.CopyN(io.Discard, reader, int64(contentLen))
 		if err != nil {
 			fmt.Fprintf(conn, "5 error reading request body\r\n")
-			_ = conn.Close()
 			return
 		}
 	}
@@ -351,109 +429,44 @@ func handleRequest(conn net.Conn, b *Broadcaster, host string, port int, mime st
 	switch path {
 	case "/", "/index.gmi", "/index.txt":
 		base := fmt.Sprintf("spartan://%s:%d", host, port)
-		body := "Spartan Radio\n\n" +
-			"=> " + base + "/radio Tune in\n"
+		body := "Spartan Radio (Ogg Vorbis)\n\n" +
+			"=> " + base + "/radio Tune in (audio/ogg)\n"
 		fmt.Fprintf(conn, "2 text/gemini; charset=utf-8\r\n%s", body)
-		_ = conn.Close()
 
 	case "/radio":
-		// handleRadio will close conn
-		handleRadio(conn, b, mime)
+		handleRadio(conn, b)
 
 	default:
 		fmt.Fprintf(conn, "4 not found\r\n")
-		_ = conn.Close()
 	}
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
-	musicDirFlag := flag.String("music-dir", "./music", "directory with audio files (can be a symlink)")
-	playlistPath := flag.String("playlist", "", "path to playlist file (one file path per line); if set, music-dir scanning is not used")
-	buildPlaylist := flag.Bool("build-playlist", false, "print playlist (based on -music-dir/-format) to stdout and exit")
-	shuffle := flag.Bool("shuffle", false, "shuffle playback order each cycle")
+	musicDirFlag := flag.String("music-dir", "./music", "directory with .ogg/.oga files (can be a symlink)")
 	port := flag.Int("port", 300, "TCP port to listen on (Spartan default is 300)")
 	host := flag.String("host", "localhost", "host name to advertise in index (spartan://HOST:PORT/...)")
-	format := flag.String("format", "mp3", "mp3|ogg|both (controls which files are in the playlist)")
-	bitrateKbps := flag.Int("bitrate-kbps", 128, "approx stream bitrate throttle (kbps)")
+	bitrateKbps := flag.Int("bitrate-kbps", 192, "target stream bitrate (kbps). Use ffprobe's audio bitrate (e.g. ~499 for your REC002.ogg)")
 	rescan := flag.Duration("rescan", 10*time.Second, "delay when playlist is empty or rebuild fails")
-	mimeOverride := flag.String("mime", "", "override MIME for /radio (advanced)")
-	logListenersEvery := flag.Duration("log-listeners", 0, "if >0, periodically log current listener count (e.g. 30s, 5m)")
 	flag.Parse()
-
-	if *bitrateKbps <= 0 {
-		log.Fatalf("-bitrate-kbps must be > 0")
-	}
 
 	root, err := resolveRoot(*musicDirFlag)
 	if err != nil {
 		log.Fatalf("failed to resolve music-dir %q: %v", *musicDirFlag, err)
 	}
 
-	f := strings.ToLower(*format)
-	if f != "mp3" && f != "ogg" && f != "both" {
-		log.Fatalf("invalid -format=%q (use mp3|ogg|both)", *format)
-	}
-
-	exts := allowedExts(f)
-
-	if *buildPlaylist {
-		files, err := buildPlaylistRecursive(root, exts)
-		if err != nil {
-			log.Fatalf("playlist error: %v", err)
-		}
-		for _, p := range files {
-			fmt.Println(p)
-		}
-		return
-	}
-
-	mime := ""
-	if *mimeOverride != "" {
-		mime = *mimeOverride
-	} else {
-		switch f {
-		case "mp3":
-			mime = "audio/mpeg"
-		case "ogg":
-			mime = "audio/ogg"
-		case "both":
-			// Mixing mp3+ogg in one stream means one fixed MIME can't be correct.
-			// This works only if the player sniffs the format from bytes.
-			mime = "application/octet-stream"
-			log.Printf("WARNING: -format=both mixes MP3+Ogg; using MIME %q for /radio", mime)
-		}
-	}
-
 	b := NewBroadcaster()
 	go b.Run()
-
-	if *logListenersEvery > 0 {
-		go func() {
-			t := time.NewTicker(*logListenersEvery)
-			defer t.Stop()
-			for range t.C {
-				log.Printf("listeners=%d", b.Count())
-			}
-		}()
-	}
-
-	go streamForever(root, exts, *playlistPath, *shuffle, b, *bitrateKbps, *rescan)
+	go streamOggFolder(root, b, *bitrateKbps, *rescan)
 
 	addr := fmt.Sprintf(":%d", *port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("failed to listen on %s: %v", addr, err)
 	}
+
 	log.Printf("Spartan Radio listening on spartan://%s:%d/", *host, *port)
 	log.Printf("Serving from (resolved): %s", root)
-	log.Printf("Format: %s (exts=%v), MIME: %s", f, exts, mime)
-	if *playlistPath != "" {
-		log.Printf("Playlist: %s (shuffle=%v)", *playlistPath, *shuffle)
-	} else {
-		log.Printf("Playlist: scanned from -music-dir (shuffle=%v)", *shuffle)
-	}
+	log.Printf("Ogg/Vorbis mode. bitrate-kbps=%d", *bitrateKbps)
 
 	for {
 		conn, err := ln.Accept()
@@ -461,6 +474,6 @@ func main() {
 			log.Printf("accept error: %v", err)
 			continue
 		}
-		go handleRequest(conn, b, *host, *port, mime)
+		go handleRequest(conn, b, *host, *port)
 	}
 }
