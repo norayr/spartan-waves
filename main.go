@@ -438,13 +438,17 @@ func streamOgg(root string, playlistPath string, shuffle bool, b *Broadcaster, b
 }
 
 func handleRadio(conn net.Conn, b *Broadcaster) {
-  defer conn.Close()
+  remote := conn.RemoteAddr().String()
+  log.Printf("Listener connected: %s", remote)
+  defer func() {
+    log.Printf("Listener disconnected: %s", remote)
+    conn.Close()
+  }()
 
   if _, err := fmt.Fprintf(conn, "2 audio/ogg\r\n"); err != nil {
     return
   }
 
-  // Pattern A: send cached Vorbis headers first for late joiners.
   if hdr := b.GetHeaderCopy(); len(hdr) > 0 {
     if _, err := conn.Write(hdr); err != nil {
       return
@@ -461,6 +465,7 @@ func handleRadio(conn net.Conn, b *Broadcaster) {
     }
   }
 }
+
 
 func handleRequest(conn net.Conn, b *Broadcaster, host string, port int) {
   defer conn.Close()
