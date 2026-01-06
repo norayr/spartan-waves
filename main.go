@@ -43,6 +43,15 @@ func NewBroadcaster() *Broadcaster {
   }
 }
 
+func (b *Broadcaster) dropSub(sub Subscriber) {
+  if _, ok := b.subs[sub]; ok {
+    delete(b.subs, sub)
+    close(sub)
+    b.subCount--
+    log.Printf("Listeners: %d", b.subCount)
+  }
+}
+
 func (b *Broadcaster) Run() {
   for {
     select {
@@ -52,25 +61,20 @@ func (b *Broadcaster) Run() {
       log.Printf("Listeners: %d", b.subCount)
 
     case sub := <-b.removeSub:
-      if _, ok := b.subs[sub]; ok {
-        delete(b.subs, sub)
-        close(sub)
-        b.subCount--
-        log.Printf("Listeners: %d", b.subCount)
-      }
+      b.dropSub(sub)
 
     case frame := <-b.broadcast:
       for sub := range b.subs {
         select {
         case sub <- frame:
         default:
-          delete(b.subs, sub)
-          close(sub)
+          b.dropSub(sub)
         }
       }
     }
   }
 }
+
 
 func (b *Broadcaster) SetHeader(h []byte) {
   b.hmu.Lock()
@@ -495,8 +499,13 @@ func broadcastFromEncoder(stdout io.Reader, b *Broadcaster) error {
 }
 
 // ---------------- Spartan handlers ----------------
-
 func handleRadio(conn net.Conn, b *Broadcaster) {
+  // TCP keepalive (kernel probes). Helps with half-open connections.
+  if tc, ok := conn.(*net.TCPConn); ok {
+    _ = tc.SetKeepAlive(true)
+    _ = tc.SetKeepAlivePeriod(30 * time.Second)
+  }
+
   remote := conn.RemoteAddr().String()
   log.Printf("Listener connected: %s", remote)
   defer func() {
@@ -504,13 +513,22 @@ func handleRadio(conn net.Conn, b *Broadcaster) {
     _ = conn.Close()
   }()
 
-  if _, err := fmt.Fprintf(conn, "2 audio/ogg\r\n"); err != nil {
+  // A helper: every write must make progress within this time.
+  const writeTimeout = 10 * time.Second
+  writeAll := func(p []byte) error {
+    _ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+    _, err := conn.Write(p)
+    return err
+  }
+
+  // Spartan response header
+  if err := writeAll([]byte("2 audio/ogg\r\n")); err != nil {
     return
   }
 
   // Send cached Vorbis headers first (late join can decode).
   if hdr := b.GetHeaderCopy(); len(hdr) > 0 {
-    if _, err := conn.Write(hdr); err != nil {
+    if err := writeAll(hdr); err != nil {
       return
     }
   }
@@ -520,11 +538,12 @@ func handleRadio(conn net.Conn, b *Broadcaster) {
   defer func() { b.removeSub <- sub }()
 
   for page := range sub {
-    if _, err := conn.Write(page); err != nil {
+    if err := writeAll(page); err != nil {
       return
     }
   }
 }
+
 
 func handleRequest(conn net.Conn, b *Broadcaster, host string, port int, streamName string) {
   defer conn.Close()
