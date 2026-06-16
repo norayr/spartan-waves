@@ -143,6 +143,7 @@ func wavExts() map[string]bool {
 	return map[string]bool{
 		".wav":  true,
 		".wave": true,
+		".flac": true,
 	}
 }
 
@@ -458,7 +459,7 @@ func feedWavForever(ffmpegPath string, stdin io.Writer, loadList func() ([]strin
 		}
 
 		for _, p := range files {
-			log.Printf("Now playing (wav input): %s", p)
+			log.Printf("Now playing: %s", p)
 			if err := decodeWavToPCMAndWrite(ffmpegPath, p, stdin); err != nil {
 				log.Printf("decode/write failed: %v", err)
 				return
@@ -597,7 +598,7 @@ func handleRequest(conn net.Conn, b *Broadcaster, host string, port int, streamN
 }
 
 func main() {
-	musicDirFlag := flag.String("music-dir", "./music", "directory with .wav/.WAV files (can be a symlink)")
+	musicDirFlag := flag.String("music-dir", "./music", "directory with .wav/.wave/.flac files (can be a symlink)")
 	playlistFlag := flag.String("playlist", "", "path to playlist text file (plain paths OR ffmpeg concat format). If set, music-dir scanning is not used.")
 	shuffleFlag := flag.Bool("shuffle", false, "shuffle playlist each cycle")
 
