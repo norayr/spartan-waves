@@ -1,28 +1,62 @@
 # Spartan Radio
 
-A minimal **Spartan protocol** audio streamer written in Go.
+A minimal **Spartan protocol** audio radio server written in Go.
 
-It serves a **single live radio stream** at `/radio`, streaming audio files from a directory in real time.
+It serves one continuous live stream at `/radio`. Source audio files are decoded
+by `ffmpeg`, converted to a common PCM format, encoded as one continuous
+Ogg/Vorbis stream, and broadcast to all connected listeners.
 
-It can play from a directory, or by using a playlist. It can also shuffle the playlist.
+The server can either:
 
-At first we were supporting MP3's because MP3's can be played from the middle of the byte stream. However, since Lagrange Gemini browser doesn't support MP3 streaming on IOS and Android (it works perfectly fine on Maemo-Leste with mobile UI), we deprecated MP3 streams and added more complex code to stream Ogg files.
-
-Now we run ffmpeg with `-source wav` or `-source ogg`, ffmpeg encodes one ogg stream out of number of files, and our radio server broadcasts it.
----
+- scan a music directory recursively, or
+- load an explicit playlist file.
 
 ## Features
 
-* 📡 **Spartan protocol** server (`spartan://`)
-* 🎶 Live radio stream at `/radio`
-* 📁 Recursive playlist generation (walks subdirectories)
-* 🔗 Music directory can be a **symlink**
-* 🎧 Supports:
+- Spartan protocol server (`spartan://`)
+- Live Ogg/Vorbis stream at `/radio`
+- WAV and FLAC source files
+- Recursive directory scanning
+- Optional playlist file
+- Optional shuffle mode
+- Music directory may be a symlink
+- Symlinked subdirectories are followed
+- Directory loops are detected and avoided
+- One continuous `ffmpeg` Ogg/Vorbis encoder
+- Cached Vorbis headers for listeners joining mid-stream
+- TCP keepalive and write deadlines for stale listener cleanup
 
-  * Ogg/Vorbis only
-* ⏱ Simple bitrate throttling (approximate, configurable)
+## Supported source formats
 
----
+The scanner and playlist loader accept these filename extensions,
+case-insensitively:
+
+- `.wav`
+- `.wave`
+- `.flac`
+
+For example, `song.WAV`, `recording.Wave`, and `album.FLAC` are accepted.
+
+MP3, OGG, OGA, Opus, and other formats are not selected by the server.
+
+The outgoing radio stream is always:
+
+```text
+audio/ogg
+```
+
+encoded with Vorbis.
+
+## Requirements
+
+- Go
+- `ffmpeg` built with the `libvorbis` encoder
+
+Check that the encoder is available:
+
+```sh
+ffmpeg -encoders | grep libvorbis
+```
 
 ## Build
 
@@ -30,90 +64,204 @@ Now we run ffmpeg with `-source wav` or `-source ogg`, ffmpeg encodes one ogg st
 go build -o spartan-radio
 ```
 
-## Usage
+## Basic usage
 
 ```sh
 ./spartan-radio [options]
 ```
 
-### Command-line options
+### Scan a directory directly
 
-| Flag            | Default     | Description                                         |
-| --------------- | ----------- | --------------------------------------------------- |
-| `-music-dir`    | `./music`   | Directory containing audio files (can be a symlink) |
-| `-port`         | `300`       | TCP port to listen on (Spartan default)             |
-| `-host`         | `localhost` | Hostname used in the index page links               |
-| `-bitrate-kbps` | `128`       | Approximate stream bitrate (throttling only)        |
-| `-playlist`     | `somefile.txt` | Playlist       |
-| `-shuffle`      |  | Shuffle the playlist       |
+A playlist file is not required. The server can recursively scan the music
+directory itself:
 
----
-
-## Build playlist
-
-```
-./build_playlist.sh ./music wav > playlist.txt
+```sh
+./spartan-radio \
+  -music-dir ./music \
+  -shuffle \
+  -host radio.example.org \
+  -port 300
 ```
 
-## Format modes
+Without `-shuffle`, files are played in lexicographical path order and the list
+repeats.
 
-### For .wav sources
+With `-shuffle`, the list is shuffled for each playback cycle.
 
-```
-./spartan-waves -source wav -music-dir ./music -shuffle -playlist playlist.txt -host radio.norayr.am
+The directory is scanned again at the beginning of every cycle, so newly added
+files can be picked up without restarting the server.
+
+### Use an explicit playlist
+
+```sh
+./spartan-radio \
+  -playlist ./playlist.txt \
+  -shuffle \
+  -host radio.example.org \
+  -port 300
 ```
 
-### For .ogg sources
+When `-playlist` is set, `-music-dir` scanning is not used.
 
+The playlist is loaded again at the beginning of every playback cycle, so edits
+take effect without restarting the server.
+
+## Playlist format
+
+The playlist may contain plain paths:
+
+```text
+music/ambient/first.wav
+music/ambient/second.flac
 ```
-./spartan-waves -source ogg -music-dir ./music -shuffle -playlist playlist.txt -host radio.norayr.am
+
+or `ffmpeg` concat-style lines:
+
+```text
+file 'music/ambient/first.wav'
+file 'music/ambient/second.flac'
 ```
----
+
+Empty lines and lines beginning with `#` or `;` are ignored.
+
+Relative paths are resolved relative to the playlist file's directory.
+
+Missing files and unsupported extensions are skipped.
+
+## Generate a WAV/FLAC playlist
+
+A playlist is only needed when you want explicit ordering or a manually
+maintained selection.
+
+Example:
+
+```sh
+find -L ./music -type f \
+  \( -iname '*.wav' -o -iname '*.wave' -o -iname '*.flac' \) \
+  -print | sort |
+awk '{
+  gsub(/\047/, "'\''\\'\'''\''", $0)
+  print "file \047" $0 "\047"
+}' > playlist.txt
+```
+
+Then run:
+
+```sh
+./spartan-radio \
+  -playlist ./playlist.txt \
+  -shuffle \
+  -host radio.example.org
+```
+
+## Command-line options
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `-music-dir` | `./music` | Directory containing WAV/WAVE/FLAC files; may be a symlink |
+| `-playlist` | empty | Playlist file; when set, directory scanning is disabled |
+| `-shuffle` | `false` | Shuffle the file list for each playback cycle |
+| `-port` | `300` | TCP listening port |
+| `-host` | `localhost` | Hostname advertised in the index link |
+| `-ffmpeg` | `ffmpeg` | Path to the `ffmpeg` executable |
+| `-bitrate-kbps` | `192` | Vorbis target bitrate; set to `0` to use quality mode |
+| `-vorbis-q` | `4` | Vorbis quality used when `-bitrate-kbps=0` |
+| `-stream-name` | empty | Stream title used in Vorbis metadata and on the index page |
+| `-rescan` | `10s` | Delay after an empty playlist or playlist loading error |
+
+## Vorbis encoding modes
+
+### Target bitrate
+
+The default is 192 kbit/s:
+
+```sh
+./spartan-radio -music-dir ./music -bitrate-kbps 192
+```
+
+### Quality mode
+
+Set the bitrate to zero to enable `ffmpeg -q:a` quality mode:
+
+```sh
+./spartan-radio \
+  -music-dir ./music \
+  -bitrate-kbps 0 \
+  -vorbis-q 4
+```
 
 ## Directory scanning behavior
 
-* The music directory itself may be a symlink
-* Subdirectories are scanned recursively
-* Symlinked subdirectories are followed
-* Directory loops are detected and avoided
-* Playlist order is lexicographical (sorted paths)
+- The music directory itself may be a symlink.
+- Subdirectories are scanned recursively.
+- Symlinked subdirectories are followed.
+- Resolved directory paths are tracked to avoid symlink loops.
+- Files are initially sorted lexicographically.
+- Only WAV, WAVE, and FLAC extensions are included.
 
 Example:
 
 ```text
 music/
 ├── ambient/
-│   ├── a.ogg
-│   └── b.ogg
-├── rock/
-│   └── song.ogg
+│   ├── first.wav
+│   └── second.flac
+├── field-recordings/
+│   └── morning.WAV
 └── live -> /mnt/music/live-recordings
 ```
-
----
 
 ## Endpoints
 
 ### `/`
 
-Index page (Gemtext):
+Returns a Gemtext index page:
 
 ```text
-Spartan Radio
+Spartan Radio (Vorbis over Spartan)
 
-=> spartan://example.org:300/radio Tune in
+=> spartan://radio.example.org:300/radio Tune in
 ```
+
+When `-stream-name` is supplied, it is used as the page title.
 
 ### `/radio`
 
-Live audio stream.
+Returns:
 
----
+```text
+2 audio/ogg
+```
 
+followed by the continuous Ogg/Vorbis audio stream.
+
+## Listener handling
+
+Each listener receives the cached Vorbis headers before current stream pages,
+allowing a client to begin decoding after joining mid-stream.
+
+The TCP connection uses keepalive probes, and each stream write has a deadline.
+Dead, disconnected, or persistently stalled clients are removed from the active
+listener set.
+
+## Example
+
+```sh
+./spartan-radio \
+  -music-dir /srv/spartan-waves/music \
+  -shuffle \
+  -host radio.norayr.am \
+  -port 300 \
+  -stream-name "Spartan Waves" \
+  -bitrate-kbps 192
+```
+
+Open:
+
+```text
+spartan://radio.norayr.am:300/
+```
 
 ## License
 
-GPL-3
-
----
-
+GPL-3.0
